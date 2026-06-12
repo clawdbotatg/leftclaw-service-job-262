@@ -98,6 +98,7 @@ contract ProvingGrounds is Ownable2Step, ReentrancyGuard {
     error NotStampHolder(address user, address buildContract);
     error NoStampHolders(address buildContract);
     error NoBountyPool(address buildContract);
+    error ZeroAmount();
     error NothingToWithdraw();
     error EthTransferFailed();
 
@@ -278,7 +279,7 @@ contract ProvingGrounds is Ownable2Step, ReentrancyGuard {
     function fundBounty(address buildContract) external payable nonReentrant {
         // Checks
         if (!_builds[buildContract].registered) revert BuildNotRegistered(buildContract);
-        if (msg.value == 0) revert NoBountyPool(buildContract);
+        if (msg.value == 0) revert ZeroAmount();
 
         // Effects
         _bountyPool[buildContract] += msg.value;
@@ -289,7 +290,9 @@ contract ProvingGrounds is Ownable2Step, ReentrancyGuard {
     /**
      * @notice Distribute a build's entire bounty pool equally across all current stamp-holders.
      * @dev Anti-gaming: every stamp-holder receives an equal share rather than rewarding the
-     *      first N claimants. Any wei remainder from integer division stays in the pool.
+     *      first N claimants. Failed individual sends (e.g. contracts rejecting ETH) return
+     *      their share to the pool rather than reverting the whole distribution.
+     *      Any wei remainder from integer division also stays in the pool.
      */
     function distributeBounty(address buildContract) external onlyOwner nonReentrant {
         // Checks
@@ -303,14 +306,21 @@ contract ProvingGrounds is Ownable2Step, ReentrancyGuard {
         uint256 perStamp = pool / count;
         if (perStamp == 0) revert NoBountyPool(buildContract);
 
-        uint256 distributed = perStamp * count;
+        // Effects: clear pool before interactions (CEI).
+        _bountyPool[buildContract] = 0;
 
-        // Effects: remaining dust (pool - distributed) stays in the pool for a later round.
-        _bountyPool[buildContract] = pool - distributed;
-
-        // Interactions
+        // Interactions: push ETH to each stamper; return share to pool on failure.
+        uint256 returned = 0;
         for (uint256 i = 0; i < count; i++) {
-            _sendEth(stampers[i], perStamp);
+            (bool success,) = payable(stampers[i]).call{ value: perStamp }("");
+            if (!success) returned += perStamp;
+        }
+
+        // Dust from integer division + any failed sends go back to pool.
+        uint256 dust = pool - (perStamp * count);
+        uint256 remainder = returned + dust;
+        if (remainder > 0) {
+            _bountyPool[buildContract] = remainder;
         }
 
         emit BountyDistributed(buildContract, perStamp, count);
